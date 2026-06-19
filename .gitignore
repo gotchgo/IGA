@@ -1,0 +1,18 @@
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.toc
+*.lof
+*.lot
+
+# Internal / not for publication
+endorser_email.txt
+paper.md
+arxiv_upload.zip
+*.zip

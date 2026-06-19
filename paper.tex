@@ -1,0 +1,657 @@
+\documentclass[11pt]{article}
+
+% --- arXiv-ready preamble (no exotic packages; compiles with pdflatex) ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{natbib}
+\bibliographystyle{abbrvnat}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\usepackage{microtype}
+\usepackage{caption}
+
+\title{No Pain, Same Gain: Interference-Gated Aggregation for
+       Constant-Memory Recurrence}
+
+\author{F\'abio de Oliveira Peres\\
+        \small Independent Researcher, Rio Verde, Goi\'as, Brazil}
+
+\date{Preprint, June 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The Transformer established that fixed-state recurrence is dispensable for
+sequence modeling---\emph{attention is all you need}---but attention pays for
+that generality with a key--value cache that grows with context
+(memory $\propto T$, $O(T^2)$ per-step cost). Growing-memory RNNs
+\citep{behrouz2026memorycaching} reclaim recurrence by caching one associative
+memory per segment so capacity grows with length, yet a faithful implementation
+collapses on multi-query associative recall (MQAR): 25.2\% at 16 key--value pairs
+versus 97.5\% for a \emph{fixed} linear-attention memory of the same width. We
+trace the collapse to \emph{aggregation}, not routing: normalizing each cached
+segment's readout before mixing destroys the global-denominator suppression that
+makes linear attention work, so any non-saturated gate mixes full-scale garbage
+at signal magnitude. We propose \textbf{Interference-Gated Aggregation (IGA)},
+which gates \emph{unnormalized} per-segment numerators and denominators inside a
+single global ratio; with gates initialized to one, IGA is numerically identical
+to the fixed memory (verified to $5\times10^{-7}$), so the fixed memory is a
+\emph{floor} and collapse is impossible by construction. We pair it with a
+\textbf{tensor-sketch polynomial router} that routes by \emph{learned identity}
+without reading token IDs---a differentiable relaxation of a count-min
+sketch---giving recall that is flat in evaluation length even when queries never
+repeat keys. We then make the recurrent state \textbf{constant in sequence
+length}: a rank-$\le S$ factorization removes the $d^2$ term exactly, and capping
+live segments with a low-rank compressed background bounds growth---$0.39$~MB at
+$d=64$ versus a KV cache that grows $\propto T$, below it from
+$T\!\approx\!1\mathrm{k}$ and $15\times$ smaller projected to a 1T-parameter model,
+at no recall loss on the headline task. On the literature's own benchmark---the
+official Zoology MQAR harness, hardest standard setting $(512,64)$---IGA reaches
+$99.2\pm0.1$ versus Mamba $23.2\pm14.0$ and Based $79.5\pm1.4$, matching full
+softmax attention ($100.0$). On a real character-level language model
+(TinyStories, 2 layers, $d=128$, 3 seeds, two contexts) IGA matches a fixed-memory
+baseline of the same width in bits-per-character within seed noise---\emph{constant
+memory at no perplexity cost}---while a cost analysis shows the one-time training
+premium is amortized by per-query inference savings that grow with context, since
+IGA is $O(T)$ per step with a constant state where softmax attention is $O(T^2)$
+per step with a $\propto T$ cache. \textbf{No pain, same gain}: the cost of
+growing memory is removed, the quality is retained.
+\end{abstract}
+
+\section{Introduction}
+
+``Attention is all you need'' \citep{vaswani2017attention} retired fixed-state
+recurrence for sequence modeling, but the price is written into the mechanism: a
+key--value cache that holds every past token. The cache grows linearly with
+context and the per-step attention product is quadratic, so memory and compute
+both scale with the sequence. This is the \emph{pain} of the attention
+paradigm---bearable at short context, dominant at long context, and eventually
+the binding constraint.
+
+Growing-memory RNNs \citep{behrouz2026memorycaching} offer the opposite bet: keep a
+recurrent state, but let it \emph{grow} by caching one associative memory per
+segment of $S$ tokens and aggregating the cached readouts with a learned gate.
+Capacity then scales with length while per-token cost stays sub-quadratic. The
+promise is attention's recall with recurrence's cost structure. We find that a
+faithful single-layer implementation of this promise does not merely fail to beat
+the fixed memory it generalizes---it collapses far below it (Section~4, Table~1).
+
+This paper makes a single, sharp proposal: a growing-memory model that carries
+\textbf{no pain, same gain}---no growing-memory cost, and the same quality as the
+strong baselines. We deliver it in three steps. First, we fix the aggregation: the
+collapse is caused by per-segment readout normalization, and gating the
+\emph{unnormalized} per-segment state inside one global ratio (IGA) removes it,
+with the fixed memory as a provable initialization floor. Second, we make the
+remaining bottleneck---segment \emph{routing}---solvable without token IDs, via a
+tensor-sketch polynomial router that routes by learned identity. Third, we make
+the state \emph{constant in sequence length}: a rank-$\le S$ factorization removes
+the quadratic-in-width term exactly, and capping live segments with a low-rank
+compressed background caps growth, giving a constant sub-KV state at no recall loss
+on the headline task. The tagline names exactly what the measurements support:
+\emph{no pain}---the growing memory and the $O(T^2)$ step are gone, leaving a
+constant state and $O(T)$ per-step compute; \emph{same gain}---recall matches full
+attention on the literature's hardest standard task ($99.2$ vs $100.0$) and
+bits-per-character matches the fixed-memory baseline on real text (within seed
+noise). The title is a compression of the result, not a slogan.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item \textbf{Diagnosis and aggregation fix (\S3.1).} The growing-memory collapse
+  is an \emph{aggregation} failure: per-segment normalization erases the
+  match-mass difference between segments. IGA gates unnormalized
+  numerator/denominator pairs inside one global ratio; at gate$\approx 1$ (init)
+  the model is the fixed memory to $5\times10^{-7}$, so learning can only
+  \emph{remove} cross-segment interference---the source of the capacity that makes
+  $K$ small memories beat one large memory.
+
+\item \textbf{Learned identity routing (\S3.2).} Summed-similarity routing is
+  kernel-family limited: it tracks the fixed memory's saturation across score
+  families and even under auxiliary supervision, whereas identity-preserving
+  summaries route exactly but exploit verbatim key repetition. Our tensor-sketch
+  polynomial router \citep{pham2013tensorsketch} is a differentiable, ID-free
+  relaxation of a count-min sketch that preserves the flat-recall property, and
+  remains flat on \textbf{MQAR-indirect}, a benchmark where queries never repeat
+  keys---recovered label-free by distilling a quadratic teacher trained only on
+  the recall loss.
+
+\item \textbf{Constant-memory state (\S3.3).} A rank-$\le S$ factorization of the
+  per-segment cache removes the $d^2$ term exactly ($<\!5\times10^{-7}$); capping
+  live segments at $K_{\max}$ with a low-rank compressed background makes the
+  recurrent state constant in $T$---$0.39$~MB at $d=64$, below the KV cache from
+  $T\!\approx\!1\mathrm{k}$ and $15\times$ smaller projected to 1T parameters,
+  with no recall loss on the $(512,64)$ task.
+
+\item \textbf{Real-text validation and deployment cost (\S5--\S6).} On a real
+  character-level language model (3 seeds, two contexts) IGA matches a
+  fixed-memory baseline of the same width in bits-per-character within seed
+  noise---the constant-memory state carries no perplexity penalty---while the
+  associative-recall advantage is shown to be task-specific (it does not transfer
+  to a planted-fact probe on natural text at this scale). A cost analysis shows
+  the one-time training premium (the gate) is amortized by per-query inference
+  savings that grow with context, since IGA is $O(T)$ per step with a constant
+  state against softmax attention's $O(T^2)$ per step with a $\propto T$ cache.
+\end{enumerate}
+
+We position the recall claims at small scale (single layer, $d=64$, synthetic
+recall) and compare against exact attention, Based \citep{arora2024based} and
+Mamba \citep{gu2023mamba} under the official Zoology protocol
+\citep{arora2023zoology} with 3 seeds throughout; the language-model experiment
+(\S5) is the one real-text setting.
+
+\section{Background and setup}
+
+\paragraph{MQAR.} Input is \texttt{k1 v1 \ldots kN vN SEP kq1 vq1 \ldots kqQ vqQ};
+the model must predict each queried value as the next token after its query key.
+We use the Zoology-style formulation with $N$ up to 128 pairs, $Q=4$ queries, key
+vocabulary 192, value vocabulary 16 (chance 6.25\%); training always at $N=48$,
+4000 steps, batch 256, AdamW $3\times10^{-4}$, identical seed before each model;
+evaluation at $N\in\{48,64,96,128\}$ with no retraining. In \S4 we additionally use
+the \emph{official} Zoology generator and training protocol (vocabulary 8192,
+power-law query gaps, learning-rate sweep over $\mathrm{logspace}(-4,-2,4)$,
+weight decay 0.1, cosine schedule, early stop at 99\%).
+
+\paragraph{Fixed memory (FIXA).} Causal linear attention
+\citep{katharopoulos2020linear} with feature map
+$\varphi(x)=\mathrm{elu}(x)+1$:
+\[
+y_t = \frac{\sum_{j\le t}\varphi(q_t)\!\cdot\!\varphi(k_j)\,v_j}
+            {\sum_{j\le t}\varphi(q_t)\!\cdot\!\varphi(k_j)}.
+\]
+A short depthwise causal convolution ($k=3$) before the projections lets one
+layer bind key--value pairs, as in Based/Mamba. Capacity is bounded by $d^2$.
+
+\paragraph{Growing memory (GRM).} Per segment $i$:
+$M^{(i)}=\sum_j v_j\varphi(k_j)^\top$,
+$z^{(i)}=\sum_j\varphi(k_j)$. At query $t$, each cached segment contributes a
+\emph{normalized} readout
+$r_i = M^{(i)}q_t / (z^{(i)}\!\cdot\!q_t)$, mixed by a softmax over match masses.
+This is the mechanism that collapses.
+
+\section{Method: Interference-Gated Aggregation}
+
+\subsection{Aggregation that cannot collapse}
+
+The fixed memory is \emph{exactly} the gate-$\equiv 1$ aggregation of
+unnormalized per-segment caches:
+\[
+y_{\mathrm{fix}} = \frac{\sum_i M^{(i)}q}{\sum_i z^{(i)}\!\cdot\!q}.
+\]
+IGA inserts the gate inside this ratio:
+\[
+y_t = \frac{N_{\mathrm{cur}} + \sum_{i<s} g_i\,M^{(i)}q_t}
+            {m_{\mathrm{cur}} + \sum_{i<s} g_i\,z^{(i)}\!\cdot\!q_t},
+\qquad
+g_i = \sigma\!\big(a(\log s_i - \mathrm{ref}) + b\big),
+\]
+where $s_i$ is a routing score and $\mathrm{ref}$ is the mean (similarity scores)
+or max (count scores) of $\log s_i$. With $b=3$, $g\approx 0.95$ everywhere at
+init $\Rightarrow$ the model \emph{starts} as the fixed memory; the unit test
+\texttt{test\_ungated\_equals\_fixed} verifies the identity to $5\times10^{-7}$.
+The gate can only \emph{remove} interference---which is precisely where the
+capacity of $K$ small memories over one large memory comes from.
+
+\paragraph{Why GRM collapses.} Instrumenting the trained GRM at $n=16$: recall
+$25.2\%$, routing accuracy of its softmax gate $90.7\%$, gate mass on the current
+segment $\approx 0$. The killer is that normalized readouts from wrong segments
+are garbage \emph{at the same magnitude as the signal}; a $0.7/0.3$ softmax mixes
+$30\%$ full-scale garbage. No fix to the softmax can help; the normalization must
+move \emph{outside} the mixture---which is what IGA does.
+
+\subsection{Learned identity routing}
+
+With aggregation fixed, IGA's residual gap to oracle is pure routing. The routing
+problem is a \emph{kernel-family} problem: every summed-similarity score
+(first/second moment, elementwise-exponential features, learned embeddings with
+auxiliary supervision) saturates exactly like the fixed memory, whereas
+\emph{identity-preserving} summaries---the token histogram or its count-min
+sketch \citep{cormode2005countmin}---route exactly (100\%/93\%+) at zero
+parameters and give recall flat in evaluation length, but they read token IDs and
+MQAR queries repeat keys verbatim. Real language does not.
+
+We need a score $s_i(q)\approx$ (occurrences of $q$'s identity in segment $i$),
+cacheable as a per-segment sum, differentiable, and ID-free. For near-orthonormal
+embeddings $\hat e$,
+$(\hat e_q\!\cdot\!\hat e_k)^p\to\delta(q=k)$ as $p$ grows, and the degree-$p$
+polynomial kernel is exactly linearizable:
+$(x\!\cdot\!y)^p = \langle x^{\otimes p},y^{\otimes p}\rangle$, compressible by
+tensor sketch \citep{pham2013tensorsketch} with
+$\mathbb{E}[\mathrm{ts}(x)\!\cdot\!\mathrm{ts}(y)]=(x\!\cdot\!y)^p$ and
+$O(1/m)$ variance for unit vectors---\emph{polynomial} cost in sharpness, where
+Performer-style estimates of a comparably sharp $\exp(\tau q\!\cdot\!k)$ require
+variance exponential in $\tau$ \citep{choromanski2021performer}. The router score
+is
+\[
+s_i = \mathrm{softplus}(w_1)\big(\hat e_q\!\cdot\!\textstyle\sum_j\hat e_{k_j}\big)
+      + \mathrm{softplus}(w_p)\,\mathrm{med}_{J}\!\big(\mathrm{ts}(\hat e_q)\!\cdot\!\textstyle\sum_j\mathrm{ts}(\hat e_{k_j})\big),
+\]
+with three design elements: (i) the \textbf{median of $J=3$ independent
+sketches}---the continuous analogue of count-min's min---lifts routing from
+$96.6\%$ to $99.8\%$ in a no-training microbenchmark on the exact MQAR segment
+statistics ($p=4$, $m=256$, $r=64$), where degree-1 alone yields only
+$39.9$--$60.8\%$ (the same saturation that limits the fixed memory); (ii) a
+\textbf{degree-1 term for cold start}, since
+$\partial(q\!\cdot\!k)^p/\partial\mathrm{emb}$ vanishes at orthogonality for
+$p\ge 2$, giving word2vec-style alignment gradients when embeddings must be
+\emph{learned}, with learnable mixture weights that let training anneal it away;
+(iii) \textbf{count-vs-similarity gate links}---count scores gate on
+$\log(\mathrm{clamp}(s))$ with a max reference (hard suppression from init), while
+learned-poly scores gate on $\log(\mathrm{softplus}(s))$ and supervise raw scores
+as logits, because learned scores can be negative at cold start and
+$\log(\mathrm{clamp})$ creates a dead gradient zone that destroys readout training
+(this distinction cost one full failed run, documented as a negative result).
+Summary cost: $r + J\!\cdot\!m = 832$ floats/segment (count-min: 256; histogram:
+$V$).
+
+\paragraph{MQAR-indirect: identity must be learned.} We introduce a benchmark in
+which the query block uses a \emph{disjoint} query vocabulary, paired to keys by a
+bijection fixed across the dataset---sequence structure, positions and protocol
+unchanged. By construction, ID-counting routers receive zero signal. Two training
+regimes: (a) auxiliary routing cross-entropy with bijection labels---\emph{privileged}
+supervision, an upper bound for the kernel family; (b) \emph{distillation}---a
+minimal quadratic softmax-attention teacher ($d=64$, 1 layer, own embeddings)
+trained only on the recall loss, whose per-segment attention mass is distilled
+into the router by KL; the teacher is discarded at inference (quadratic cost only
+during training, mirroring SMT \citep{kumar2026smt}). The teacher solves the task
+at $100\%$, confirming softmax attention does not suffer the perverse equilibrium.
+
+\subsection{Constant-memory state}
+
+A growing memory that beats the fixed memory on recall but grows without bound
+does not yet answer the paradigm question---its state would eventually exceed the
+KV cache it is meant to replace. We make the recurrent state \textbf{constant in
+$T$} in two steps, both presented as design rather than patch.
+
+\paragraph{Factored state.} The per-segment cache
+$M^{(i)}=\sum_{j\in\mathrm{seg}_i}v_j\varphi(k_j)^\top$ is a sum of $S$ rank-1
+updates, so $\mathrm{rank}(M^{(i)})\le S=16$. We factor it exactly as
+$M^{(i)}={U^{(i)}}^\top W^{(i)}$ with $U^{(i)},W^{(i)}\in\mathbb{R}^{S\times d}$
+(rank $R=S$), storing $2dS$ floats per segment instead of $d^2$ and computing the
+readout $M^{(i)}q = {U^{(i)}}^\top(W^{(i)}q)$ at $2dS$ cost instead of $d^2$. The
+factorization is exact for a rank-$\le S$ matrix, so the model output is
+unchanged up to floating-point error---\texttt{test\_factored\_equals\_dense}
+verifies the identity (threshold $10^{-4}$; measured gap $<\!5\times10^{-7}$)---and
+at the official Zoology task $(512,64)$ the factored model matches the dense one
+within seed noise (dense $99.02\pm0.17$, factored $99.18\pm0.08$, 3 seeds).
+Factoring removes the quadratic-in-width term ($d^2\to 2dS$: $4096\to 2048$
+elements at $d=64$), but the state still grows with the number of segments,
+$O(T/S)$.
+
+\paragraph{Capped memory.} We bound the number of \emph{live} cached segments at
+$K_{\max}$ and compress the overflow into a single low-rank background of rank
+$r_{\mathrm{bg}}$. The recurrent state becomes
+\[
+\mathrm{state} = K_{\max}\!\cdot\!\mathrm{per\_seg}
+               + (2d\,r_{\mathrm{bg}} + d + m) + K_{\max},
+\]
+independent of $T$, where $\mathrm{per\_seg}=2dS+d+m$. Compression is a
+deterministic FIFO eviction with normalization of the compressed readout; live
+segments and the compressed background are mixed inside IGA's single global ratio,
+so the interference-gated aggregation of \S3.1 is preserved. At the official task
+$(512,64)$ the context is exactly $K_{\max}=32$ segments, so no eviction occurs and
+the capped model is a no-op: recall is identical to the uncapped factored
+model---$99.23/99.30/99.02$ (mean $99.18$) across three seeds. The honest price of
+constant memory is that segments older than $K_{\max}$ are compressed (lossy):
+recall of facts within the last $K_{\max}$ segments tracks the unlimited baseline
+even with hundreds of evictions, while older facts are not individually
+recoverable---the explicit recall/memory tradeoff.
+
+\section{Experiments---associative recall}
+
+All numbers are mean $\pm$ std over 3 seeds unless noted. Baselines: exact
+attention (2-layer MHA with learned positions), Based (official hybrid: BaseConv +
+Taylor-exp linear attention), Mamba (S6; pure-PyTorch reimplementation with exact
+parallel scan, unit-tested against the sequential reference). Backbone,
+initialization (GPT-2 scheme) and hyperparameters follow the Zoology Figure-2
+configuration. A negative finding, verified against the \emph{official}
+implementation: the 2-layer attention-only Figure-2 configuration does not form the
+induction circuit under our infinite-stream protocol (fresh samples every step
+remove the memorization bootstrap); it plateaus at $\sim$$13\%$ across learning
+rates, and the official \texttt{zoology.model.LanguageModel} trained under the same
+loop gives $12.3\%$---identical to our replica---while under the official
+fixed-data regime our replica \emph{does} reproduce the published induction-head
+transition. We therefore report \textbf{attention-conv}---a single-layer
+exact-attention model with the same short-convolution stem every other model
+has---as the working upper anchor.
+
+\subsection{Verbatim MQAR (our protocol)}
+
+Train at $n=48$ ($n_k=192$), evaluate without retraining; chance 6.25\%.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\toprule
+model & $n{=}48$ & $n{=}64$ & $n{=}96$ & $n{=}128$ \\
+\midrule
+attention (Zoology fig2) & 12.9\,$\pm$\,0.0 & 11.1\,$\pm$\,0.5 & 9.7\,$\pm$\,0.5 & 9.0\,$\pm$\,0.4 \\
+based                   & 8.3\,$\pm$\,0.1  & 7.9\,$\pm$\,0.2  & 7.3\,$\pm$\,0.2 & 7.3\,$\pm$\,0.1 \\
+mamba                   & 13.3\,$\pm$\,0.0 & 12.3\,$\pm$\,0.1 & 10.6\,$\pm$\,0.2 & 9.6\,$\pm$\,0.4 \\
+FIXA(64)                & 77.9\,$\pm$\,1.0 & 71.6\,$\pm$\,0.8 & 59.9\,$\pm$\,0.4 & 50.9\,$\pm$\,0.4 \\
+FIXA(128)               & 92.1\,$\pm$\,0.5 & 88.8\,$\pm$\,0.6 & 81.8\,$\pm$\,1.0 & 74.5\,$\pm$\,1.1 \\
+IGA-hist (IDs)          & 98.3\,$\pm$\,0.1 & 98.3\,$\pm$\,0.1 & 98.4\,$\pm$\,0.2 & \textbf{98.5\,$\pm$\,0.1} \\
+IGA-sketch (IDs)        & 98.1\,$\pm$\,0.1 & 98.1\,$\pm$\,0.1 & 98.1\,$\pm$\,0.2 & 98.0\,$\pm$\,0.2 \\
+\textbf{IGA-poly (no IDs)} & 97.7\,$\pm$\,0.1 & 97.6\,$\pm$\,0.2 & 97.5\,$\pm$\,0.2 & \textbf{97.1\,$\pm$\,0.2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All IGA variants are flat in evaluation length; the ID-free polynomial router
+pays $0.8$--$1.4$ points of sketch noise relative to the exact histogram. The
+2-layer literature baselines fail in this regime (48 pairs at $d=64$, far beyond
+their capacity-favorable setting).
+
+\subsection{MQAR-indirect}
+
+Same protocol; the query never repeats the key.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\toprule
+model & $n{=}48$ & $n{=}64$ & $n{=}96$ & $n{=}128$ \\
+\midrule
+attention (Zoology fig2) & 13.1\,$\pm$\,0.1 & 11.5\,$\pm$\,0.4 & 9.9\,$\pm$\,0.2 & 9.2\,$\pm$\,0.2 \\
+based                     & 7.4\,$\pm$\,0.3  & 7.3\,$\pm$\,0.1  & 6.8\,$\pm$\,0.2 & 6.8\,$\pm$\,0.1 \\
+mamba                    & 13.3\,$\pm$\,0.0 & 12.2\,$\pm$\,0.1 & 10.6\,$\pm$\,0.3 & 9.6\,$\pm$\,0.3 \\
+FIXA(64)                 & 57.6\,$\pm$\,20.8 & 51.4\,$\pm$\,19.4 & 42.5\,$\pm$\,16.2 & 36.8\,$\pm$\,13.9 \\
+IGA-sketch (control)     & 57.2\,$\pm$\,20.6 & 50.9\,$\pm$\,19.1 & 42.1\,$\pm$\,15.9 & 36.4\,$\pm$\,13.6 \\
+IGA-emb+aux (exp family) & 68.6\,$\pm$\,17.8 & 62.2\,$\pm$\,17.9 & 52.1\,$\pm$\,16.0 & 45.1\,$\pm$\,13.8 \\
+\textbf{IGA-poly+aux (privileged)}        & 96.1\,$\pm$\,0.7 & 95.8\,$\pm$\,0.7 & 95.4\,$\pm$\,0.7 & \textbf{94.8\,$\pm$\,0.9} \\
+\textbf{IGA-poly distilled (label-free)}   & 93.5\,$\pm$\,1.0 & 92.6\,$\pm$\,1.4 & 90.5\,$\pm$\,1.8 & \textbf{88.2\,$\pm$\,2.2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The ID-counting control tracks FIXA seed-by-seed (routing $6.0\%=$ chance),
+confirming the benchmark removes the verbatim shortcut by construction. The
+polynomial-kernel router preserves the flat-recall property with \emph{fully
+learned} identity: $+58$ points over the fixed memory at $n=128$, and the
+label-free distilled variant retains $93$--$96\%$ of the privileged upper bound.
+
+\subsection{Official Zoology protocol (vocabulary 8192)}
+
+Official generator and training loop; 3 seeds, mean $\pm$ std.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcc}
+\toprule
+model & $(128,8)$ easy & $(512,64)$ hard \\
+\midrule
+attention (full softmax)          & 99.4\,$\pm$\,0.3 & 100.0\,$\pm$\,0.0 \\
+attention-conv (1-layer anchor)   & 99.3\,$\pm$\,0.3 & 99.4\,$\pm$\,0.0 \\
+based                             & 99.2\,$\pm$\,0.2 & 79.5\,$\pm$\,1.4 \\
+mamba                             & 99.1\,$\pm$\,0.0 & 23.2\,$\pm$\,14.0 \\
+\textbf{IGA-sketch (ours)}        & 99.1\,$\pm$\,0.0 & \textbf{99.1\,$\pm$\,0.0} \\
+\textbf{IGA-poly (ours, learned identity)} & 99.1\,$\pm$\,0.0 & \textbf{99.2\,$\pm$\,0.1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The discriminating regime is $(512,64)$: 64 key--value pairs over a 512-token
+context ($32$ segments of $S=16$---$2\times$ more segments than any setting
+above). All six models solve the easy task. On the hard task the efficient
+baselines separate exactly as the Based paper reports: \textbf{Mamba collapses
+($23.2\pm14.0$, one seed at $7\%$---the fixed-state saturation) and Based degrades
+($79.5\pm1.4$).} \textbf{Both IGA models hold at $\sim\!99\%$}, matching full
+softmax attention ($100\%$) and the convolutional attention anchor ($99.4$), at
+sub-quadratic per-token cost. This is the citable result that closes the
+comparison: on the literature's own benchmark, in its hardest standard setting,
+the growing memory keeps near-perfect recall where the fixed-state models fail.
+
+\subsection{Inference cost}
+
+Batch 1, $d=64$, fp32, reference Python loops on both sides (scaling comparison,
+not engineering constants).
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccl}
+\toprule
+model & $T{=}4096$ & $T{=}16384$ & $T{=}65536$ & state @ $T{=}65536$ \\
+ & tok/s & tok/s & tok/s & \\
+\midrule
+attention (SDPA, KV cache)      & 3577 & 997 & 253 & 32.0~MB ($\propto T$) \\
+IGA-poly recurrent, soft gate   & 3337 & 3721 & 3167 & \textbf{0.39~MB} (const) \\
+IGA-poly recurrent, hard top-1 & 4885 & 4725 & \textbf{4455} & \textbf{0.39~MB} (const) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+IGA throughput is $\sim$flat in context length; incremental exact attention
+degrades linearly, $17.6\times$ slower at $64$k. The state column reports the
+constant-memory state of \S3.3---$0.39$~MB constant---against a KV cache that
+grows $\propto T$ ($32$~MB at $64$k). The throughput crossover and the constant
+sub-KV state are the claims.
+
+\subsection{Constant-memory scaling and the long-context regime}
+
+With the factored + capped state, the recurrent state is constant in $T$. Measured
+with \texttt{state\_bytes} ($d=64$, $K_{\max}=32$, $r_{\mathrm{bg}}=16$, fp32) at
+$0.39$~MB against the KV cache $2Td$:
+
+\begin{table}[h]\centering
+\begin{tabular}{lccl}
+\toprule
+$T$ & KV cache & IGA (constant) & ratio \\
+\midrule
+512   & 0.25~MB  & 0.39~MB & 1.53$\times$ \\
+1024  & 0.50~MB  & 0.39~MB & 0.76$\times$ \\
+2048  & 1.00~MB  & 0.39~MB & 0.38$\times$ \\
+4096  & 2.00~MB  & 0.39~MB & 0.19$\times$ \\
+65536 & 32.0~MB  & 0.39~MB & 0.012$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The state equals the cache at the crossover $T\approx 2K_{\max}S$ (where the cache
+fills exactly $K_{\max}$ segments); below it the constant state is larger---it is
+sized for capacity, not the current context---and above it the advantage grows
+without bound. Projected to a 1T-parameter regime ($d=8192$, $K_{\max}=4096$,
+$r_{\mathrm{bg}}=4$), the constant state is $209.5$~GB $=0.065\times$ the $3.1$~TB
+KV cache---\textbf{$15\times$ smaller, and constant}---where the dense IGA state
+would be $800$~TB ($256\times$ larger) and even the factored-but-uncapped state is
+$3.2$~TB (parity, still growing). The constant sub-KV state is the memory result.
+
+\section{Real-text language modeling: constant memory at no perplexity cost}
+
+All \S4 results use synthetic associative recall. We close the remaining
+question---does the constant-memory IGA carry a perplexity penalty on \emph{real}
+text?---by training a 2-layer, $d=128$ IGA language model (segment size 64;
+tensor-sketch polynomial router reading raw tokens; factored state of \S3.3)
+against the \emph{identical} architecture with the gate disabled
+(\texttt{gated=False}, the FIXA fixed-memory baseline of the same width and
+parameter count). Data is character-level TinyStories, 88~MB, downloaded---no
+synthetic data is generated for any language-model experiment. Optimizer AdamW
+$3\times10^{-4}$, batch 16, 4000 steps, 3 seeds, contexts $\{1024, 2048\}$. We
+report bits-per-character (bpc) on a 5\% held out split and a planted-fact recall
+probe---the MQAR analogue on natural text---at three distances (ctx/4, ctx/2,
+ctx$-$64).
+
+\begin{table}[h]\centering
+\begin{tabular}{lccccc}
+\toprule
+ctx & IGA bpc & FIXA bpc & $\Delta$ bpc (IGA$-$FIXA) & recall@ctx$-$64 IGA & recall@ctx$-$64 FIXA \\
+\midrule
+1024 & 2.1607\,$\pm$\,0.0060 & 2.1621\,$\pm$\,0.0084 & $-$0.0015 & 1.67 & 1.67 \\
+2048 & 2.1138\,$\pm$\,0.0114 & 2.1143\,$\pm$\,0.0127 & $-$0.0005 & 2.29 & 2.08 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two findings. (i) \textbf{No perplexity cost.} The bpc difference is $-0.0015$
+(ctx 1024) and $-0.0005$ (ctx 2048), both an order of magnitude below the per-seed
+std ($0.006$--$0.013$); IGA is never consistently worse across the six (model,
+seed) runs. The constant-memory state therefore does not degrade language
+modeling relative to a fixed-memory model of the same width and parameter count.
+(ii) \textbf{The recall advantage is task-specific.} The planted-fact probe is
+near chance for both models at both contexts ($1.7$--$2.3\%$, per-seed spread
+$0$--$4.4\%$---pure noise, no distance dependence); the flat-recall advantage of
+\S4 does not transfer to retrieval of an arbitrary planted fact in natural text at
+$d=128$. The structured MQAR benchmark remains the right instrument for the
+associative-recall claim; natural-text retrieval at this scale does not separate
+the architectures, and scaling $d$/ctx to surface a separation is left to future
+work (GPU-budget-bound).
+
+\paragraph{Compute.} IGA costs $5.2\times$ (ctx 1024) and $4.9\times$ (ctx 2048)
+more wall-clock per step than FIXA in our reference Python-loop implementation---the
+gate's per-segment normalization, dominated by loop overhead rather than
+asymptotic FLOPs. The tradeoff is memory-vs-compute (constant $O(1)$ state against
+higher per-step compute), not memory-vs-quality: quality is matched within noise.
+
+We note honestly that a preliminary 300-step run in the parent project reported a
+$\sim$$0.016$ bpc gain at ctx $\ge 2048$; it does \textbf{not} reproduce under the
+3-seed, 4000-step protocol here ($\Delta=-0.0005$, within noise). The
+language-model result is a no-regression result, not a quality gain.
+
+\section{Deployment economics: where constant memory pays}
+
+This section synthesizes \S4.4 (throughput), \S4.5 (memory) and \S5 (LM quality)
+into the deployment-cost picture---the regime in which a growing-memory model is
+actually meant to replace a KV-cache transformer.
+
+\paragraph{Training (one-time).} Per step, softmax attention is $O(T^2 d)$---the
+QK$^\top$ and AV products over the full $T\!\times\!T$ matrix---while IGA's
+linear-attention recurrence is $O(Td^2)$ (the factored state update is $O(TdS)$,
+smaller). The asymptotic FLOP scaling therefore favors IGA as context grows, with
+ratio $T/d$: $\sim$$8\times$ fewer attention-FLOPs at ctx 1024 ($d=128$),
+$\sim$$512\times$ at $T=64$k ($d=64$). We did \emph{not} train a transformer
+language-model baseline, so we state the training-cost comparison as complexity
+analysis, not as a measured number; the one comparison we \emph{do} measure
+end-to-end is inference throughput against exact attention (\S4.4: $14$--$17.6\times$
+at $64$k). The $5\times$ wall-clock premium of \S5, in contrast, \emph{is}
+measured---against the \emph{fixed-memory linear baseline} (FIXA), the relevant
+same-family control for the gate's overhead.
+
+\paragraph{Inference (recurring, per generated token).} A KV-cache transformer
+reads the full cache per token---$O(TdL)$ memory traffic---and holds a cache of
+$2TdL$ that grows $\propto T$. IGA reads a constant $O(K_{\max}dS)$ per token and
+holds a constant state. Measured at batch 1, $d=64$ (\S4.4): IGA holds
+$\sim$$4.5$k tok/s flat from $T=4$k to $64$k, while incremental exact attention
+degrades $\sim$$14\times$ to $253$ tok/s at $64$k. Per-token inference cost of IGA
+is constant in $T$; the transformer's grows with $T$.
+
+\paragraph{Amortization.} Training is paid once; inference is paid per query
+across the model's serving lifetime. The one-time $5\times$ gate premium (against
+the linear baseline) is amortized by the recurring inference savings once the
+served context is long enough that the constant state undercuts the cache---the
+crossover $T\approx 2K_{\max}S$ of \S4.5, $15\times$ smaller projected to 1T. Below
+the crossover, where the cache is itself small and attention is fast, the
+transformer is the cheaper option and IGA's advantage is only the recall capacity
+of \S4; above it, IGA's per-token cost stops growing while the transformer's keeps
+growing, so the total cost of serving long contexts eventually favors IGA by an
+unbounded margin. Past the point where the KV cache no longer fits on device, IGA
+is not the cheaper option but the only feasible one.
+
+This is a cost-structure argument, not a measured deployment dollar figure:
+absolute cost depends on hardware, batching and kernel fusion not modeled here
+(reference Python loops). The structural claim---$O(1)$ memory and
+$O(1)$-in-$T$ per-token compute against $O(T)$ and $O(T)$ for the cache, with
+matched LM quality (\S5)---is what the constant-memory result buys. That is the
+``no pain'': the growing-memory cost is removed. The ``same gain'' is the matched
+recall (\S4.3) and matched perplexity (\S5).
+
+\section{Related work}
+
+\paragraph{Efficient-attention recall benchmarks.} Zoology
+\citep{arora2023zoology} established MQAR as the discriminating task between
+attention and efficient mixers; Based \citep{arora2024based} frames the
+recall-throughput tradeoff. We adopt their harness and add MQAR-indirect, which
+isolates \emph{identity learning} from \emph{identity exploitation}---to our
+knowledge the first recall benchmark where queries never repeat keys by
+construction.
+
+\paragraph{Growing memory.} Memory Caching \citep{behrouz2026memorycaching}
+proposes segment-cached memories with gated aggregation (GRM among its variants).
+We keep its state layout ($M^{(i)}, z^{(i)}$) and cost, and replace its aggregation
+(the collapse cause) and its routing (the saturation cause). Its state grows with
+the number of cached segments ($O(T/S)$, quadratic in width via $d^2$); our
+factored + capped state (\S3.3) is constant in $T$ and linear in width, removing
+the growth that would otherwise exceed the KV cache it is meant to replace.
+
+\paragraph{Polynomial sketches in attention.} PolySketchFormer
+\citep{kacham2023polysketchformer} uses polynomial sketches to \emph{replace the
+attention kernel itself}. Our use is different: the sketch summarizes
+\emph{segment identity} for routing in a growing-memory RNN; attention/readout
+keeps its own feature map. Count sketch \citep{charikar2002countsketch}, count-min
+\citep{cormode2005countmin} and tensor sketch \citep{pham2013tensorsketch} supply
+the estimators; the median-of-$J$ variant mirrors count-min's min under signed
+estimates.
+
+\paragraph{Linear attention and SSMs.} The fixed memory is
+\citet{katharopoulos2020linear}; Based and Mamba are the strongest small-scale
+recall baselines in this family. Performer \citep{choromanski2021performer}
+approximates $\exp(q\!\cdot\!k)$ with random features; our variance argument
+(\S3.2) explains why that family cannot provide $\delta$-sharp identity routing at
+fixed feature budget.
+
+\paragraph{Distillation across compute classes.} SMT \citep{kumar2026smt} trains
+an RNN with a parallel teacher; our teacher-to-router distillation transfers
+\emph{routing} (not state updates) and is, to our knowledge, the first label-free
+recovery of identity routing in a growing-memory model.
+
+\section{Limitations and honest notes}
+
+\begin{itemize}
+\item Single-layer $d=64$ synthetic recall is the headline setting; the language
+  model of \S5 uses 2 layers, $d=128$, char-level TinyStories, 3 seeds, two
+  contexts (downloaded corpus, no synthetic data). IGA matches the fixed-memory
+  baseline in bpc within seed noise (no perplexity cost), but the planted-fact
+  recall probe is near chance for both at this scale, and the $\sim$$0.016$ bpc
+  gain reported by a preliminary 300-step run does \emph{not} reproduce under the
+  3-seed 4000-step protocol; the associative-recall advantage is demonstrated on
+  structured MQAR (\S4), not on natural-text retrieval at $d=128$. Scaling $d$ and
+  context to surface a recall separation on real text is left to future work
+  (GPU-budget-bound).
+\item The indirect bijection is 1-to-1 and deterministic; real paraphrase is
+  many-to-many and noisy.
+\item The privileged-aux arm uses bijection labels; the distillation arm removes
+  them but adds a quadratic teacher \emph{during training only}. No arm learns
+  routing from the recall gradient alone---the routing-family analysis of \S3.2
+  suggests this is impossible in this regime (perverse equilibrium); we state it
+  as a conjecture, not a theorem.
+\item Mamba is a pure-PyTorch reimplementation (exact scan, unit-tested); absolute
+  wall-clock comparisons to fused-kernel implementations would be unfair and are
+  not made---only task accuracy is compared.
+\item The cost benchmark uses reference Python loops on both sides (no fused
+  kernels); it measures \emph{scaling}, not engineering constants. The recurrent
+  state is constant in $T$ (\S3.3) and below the KV cache from $T\approx 1$k
+  onward; at the smallest contexts ($T\lesssim 2K_{\max}S$) the constant state is
+  sized for capacity and exceeds the cache. Segments older than $K_{\max}$ are
+  compressed (lossy), the explicit recall/memory tradeoff.
+\item Seeds: 3 per cell. Std is sample std (Bessel). No hyperparameter search was
+  performed for our models beyond the E0 microbenchmark ($p,m,J,r$); baselines
+  received the official learning-rate sweep.
+\end{itemize}
+
+\section{Reproduction}
+
+\begin{verbatim}
+pip install -r requirements.txt
+python3 tests/test_sanity.py          # 14 equivalence/property tests
+                                       # (incl. factored==dense <5e-7, IGA==fixed at init)
+python3 scripts/run_cost.py            # inference cost (~5 min)
+python3 scripts/run_multiseed.py all   # our models, 3 seeds
+python3 scripts/run_baselines_ours.py all   # literature baselines, our protocol
+python3 scripts/run_zoology.py all     # official protocol (incl. (512,64))
+python3 scripts/aggregate.py          # tables (mean +/- std)
+python3 scripts/run_factored_check.py # factored vs dense recall at (512,64), 3 seeds
+python3 scripts/run_fixb_check.py      # capped-memory recall == factored + constant-state table
+python3 scripts/project_memory.py     # memory projection (small/medium/1T)
+# Real-text language modeling (downloaded TinyStories; isolated folder):
+python3 multicamada/run_lm_ml.py --steps 4000 --ctx 1024 --seeds 0,1,2 --tag lm_full
+python3 multicamada/run_lm_ml.py --steps 4000 --ctx 2048 --seeds 0,1,2 --tag lm_full_ctx2048
+\end{verbatim}
+
+The language-model experiment uses the repository's existing multi-layer model
+\texttt{IGALM} (\texttt{src/models/iga\_layer.py},
+$n_{\mathrm{layers}}{=}2$, $d=128$, factored-capable) compared against itself with
+\texttt{gated=False} (the FIXA baseline of matched width/parameters), isolated in
+the \texttt{multicamada/} folder. The corpus is the downloaded TinyStories sample
+(88~MB); no synthetic LM data is generated. All runs are resumable
+(skip-if-exists per JSON in \texttt{results/raw/}).
+
+\bibliography{references}
+
+\end{document}
