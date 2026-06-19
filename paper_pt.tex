@@ -1,0 +1,718 @@
+\documentclass[11pt]{article}
+
+% --- Preâmbulo (versão português brasileiro) ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{natbib}
+\bibliographystyle{abbrvnat}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\usepackage{microtype}
+\usepackage{caption}
+
+\title{No Pain, Same Gain: Interference-Gated Aggregation for
+       Constant-Memory Recurrence}
+
+\author{F\'abio de Oliveira Peres\\
+        \small Pesquisador Independente, Rio Verde, Goi\'as, Brasil}
+
+\date{Preprint, junho de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+O Transformer estabeleceu que a recorr\^encia de estado fixo \'e dispens\'avel
+para modelagem de sequ\^encias --- aten\c{c}\~ao \'e tudo o que voc\^e precisa ---
+mas a aten\c{c}\~ao paga por essa generalidade com um cache
+chave--valor que cresce com o contexto (mem\'oria $\propto T$, custo $O(T^2)$ por
+passo). RNNs de mem\'oria crescente \citep{behrouz2026memorycaching} recuperam a
+recorr\^encia armazenando uma mem\'oria associativa por segmento, de modo que a
+capacidade cresce com o comprimento, mas uma implementa\c{c}\~ao fiel colapsa no
+multi-query associative recall (MQAR): $25{,}2\%$ com 16 pares chave--valor
+contra $97{,}5\%$ de uma mem\'oria de aten\c{c}\~ao linear \emph{fixa} de mesma
+largura. Rastreamos o colapso at\'e a \emph{agrega\c{c}\~ao}, n\~ao ao
+roteamento: normalizar o readout de cada segmento em cache antes da mistura
+destr\'oi a supress\~ao por denominador global que faz a aten\c{c}\~ao linear
+funcionar, de modo que qualquer gate n\~ao saturado mistura lixo em escala plena
+na magnitude do sinal. Propomos a \textbf{Agrega\c{c}\~ao com Gating por
+Interfer\^encia (IGA)}, que aplica gate aos numeradores e denominadores por
+segmento \emph{n\~ao-normalizados} dentro de uma \'unica raz\~ao global; com
+gates inicializados em um, a IGA \'e numericamente id\^entica \`a mem\'oria fixa
+(verificado at\'e $5\times10^{-7}$), de modo que a mem\'oria fixa \'e um
+\emph{piso} e o colapso \'e imposs\'ivel por constru\c{c}\~ao. A combinamos com um
+\textbf{roteador polinomial de tensor-sketch} que roteia por \emph{identidade
+aprendida} sem ler token IDs --- uma relaxa\c{c}\~ao diferenci\'avel de um
+count-min sketch --- dando recall plano no comprimento de avalia\c{c}\~ao mesmo
+quando as queries nunca repetem chaves. Tornamos ent\~ao o estado recorrente
+\textbf{constante no comprimento da sequ\^encia}: uma fatora\c{c}\~ao de
+posto~$\le S$ remove o termo $d^2$ exatamente, e limitar os segmentos vivos com um
+background comprimido de baixo posto limita o crescimento --- $0{,}39$~MB em
+$d=64$ contra um cache KV que cresce $\propto T$, abaixo dele a partir de
+$T\!\approx\!1\mathrm{k}$ e $15\times$ menor projetado para um modelo de 1T
+par\^ametros, sem perda de recall na tarefa principal. No benchmark pr\'oprio da
+literatura --- o harness oficial Zoology MQAR, configura\c{c}\~ao-padr\~ao mais
+dif\'icil $(512,64)$ --- a IGA atinge $99{,}2\pm0{,}1$ contra Mamba
+$23{,}2\pm14{,}0$ e Based $79{,}5\pm1{,}4$, empatando com a aten\c{c}\~ao softmax
+total ($100{,}0$). Em um modelo de linguagem real em n\'ivel de caractere
+(TinyStories, 2 camadas, $d=128$, 3 seeds, dois contextos) a IGA empata com um
+baseline de mem\'oria fixa de mesma largura em bits-por-caractere dentro do
+ru\'ido entre seeds --- \emph{mem\'oria constante sem custo de perplexidade} ---
+enquanto uma an\'alise de custo mostra que o pr\^emio \'unico de treino \'e
+amortizado por economias de infer\^encia por query que crescem com o contexto,
+j\'a que a IGA \'e $O(T)$ por passo com estado constante onde a aten\c{c}\~ao
+softmax \'e $O(T^2)$ por passo com cache $\propto T$. \textbf{No pain, same gain}:
+o custo da mem\'oria crescente \'e removido, a qualidade \'e mantida.
+\end{abstract}
+
+\section{Introdu\c{c}\~ao}
+
+``Aten\c{c}\~ao \'e tudo o que voc\^e precisa'' \citep{vaswani2017attention}
+aposentou a recorr\^encia de estado fixo para modelagem de sequ\^encias, mas o
+pre\c{c}o est\'a escrito no mecanismo: um cache chave--valor que guarda cada
+token passado. O cache cresce linearmente com o contexto e o produto de aten\c{c}\~ao
+por passo \'e quadr\'atico, de modo que mem\'oria e computa\c{c}\~ao escalam com a
+sequ\^encia. Essa \'e a \emph{dor} do paradigma de aten\c{c}\~ao --- suport\'avel
+em contexto curto, dominante em contexto longo, e eventualmente a restri\c{c}\~ao
+determinante.
+
+RNNs de mem\'oria crescente \citep{behrouz2026memorycaching} oferecem a aposta
+oposta: mantenha um estado recorrente, mas deixe-o \emph{crescer} armazenando uma
+mem\'oria associativa por segmento de $S$ tokens e agregando os readouts em cache
+com um gate aprendido. A capacidade ent\~ao escala com o comprimento enquanto o
+custo por token permanece sub-quadr\'atico. A promessa \'e o recall da aten\c{c}\~ao
+com a estrutura de custo da recorr\^encia. Verificamos que uma implementa\c{c}\~ao
+fiel de camada \'unica dessa promessa n\~ao apenas falha em superar a mem\'oria
+fixa que ela generaliza --- ela colapsa bem abaixo dela (Se\c{c}\~ao~4, Tabela~1).
+
+Este paper faz uma \'unica proposta afiada: um modelo de mem\'oria crescente que
+carrega \textbf{no pain, same gain} --- sem custo de mem\'oria crescente, e a
+mesma qualidade dos baselines fortes. Entregamos em tr\^es passos. Primeiro,
+consertamos a agrega\c{c}\~ao: o colapso \'e causado pela normaliza\c{c}\~ao do
+readout por segmento, e aplicar gate ao estado por segmento \emph{n\~ao-normalizado}
+dentro de uma raz\~ao global \'unica (IGA) o remove, com a mem\'oria fixa como um
+piso de inicializa\c{c}\~ao demonstr\'avel. Segundo, tornamos o gargalo restante
+--- roteamento de segmento --- solucion\'avel sem token IDs, via um roteador
+polinomial de tensor-sketch que roteia por identidade aprendida. Terceiro,
+tornamos o estado \emph{constante no comprimento da sequ\^encia}: uma
+fatora\c{c}\~ao de posto~$\le S$ remove o termo quadr\'atico-na-largura exatamente,
+e limitar os segmentos vivos com um background comprimido de baixo posto limita o
+crescimento, dando um estado sub-KV constante sem perda de recall na tarefa
+principal. O slogan nomeia exatamente o que as medi\c{c}\~oes sustentam:
+\emph{no pain} --- a mem\'oria crescente e o passo $O(T^2)$ sumiram, deixando um
+estado constante e computa\c{c}\~ao $O(T)$ por passo; \emph{same gain} --- o recall
+iguala a aten\c{c}\~ao total na tarefa-padr\~ao mais dif\'icil da literatura
+($99{,}2$ vs $100{,}0$) e o bits-por-caractere iguala o baseline de mem\'oria fixa
+em texto real (dentro do ru\'ido entre seeds). O t\'itulo \'e uma compress\~ao do
+resultado, n\~ao um slogan.
+
+\paragraph{Contribui\c{c}\~oes.}
+\begin{enumerate}
+\item \textbf{Diagn\'ostico e conserto da agrega\c{c}\~ao (\S3.1).} O colapso da
+  mem\'oria crescente \'e uma falha de \emph{agrega\c{c}\~ao}: a normaliza\c{c}\~ao
+  por segmento apaga a diferen\c{c}a de massa de match entre segmentos. A IGA
+  aplica gate a pares numerador/denominador n\~ao-normalizados dentro de uma
+  raz\~ao global \'unica; com gate$\approx 1$ (init) o modelo \'e a mem\'oria fixa
+  at\'e $5\times10^{-7}$, de modo que o aprendizado s\'o pode \emph{remover} a
+  interfer\^encia entre segmentos --- a fonte da capacidade que faz $K$ mem\'orias
+  pequenas vencerem uma grande.
+
+\item \textbf{Roteamento por identidade aprendida (\S3.2).} O roteamento por
+  similaridade somada \'e limitado pela fam\'ilia de kernels: ele acompanha a
+  satura\c{c}\~ao da mem\'oria fixa atrav\'es de fam\'ilias de scores e mesmo sob
+  supervis\~ao auxiliar, enquanto resumos que preservam identidade roteiam
+  exatamente mas exploram repeti\c{c}\~ao literal de chaves. Nosso roteador
+  polinomial de tensor-sketch \citep{pham2013tensorsketch} \'e uma relaxa\c{c}\~ao
+  diferenci\'avel, sem IDs, de um count-min sketch que preserva a propriedade de
+  recall plano, e permanece plano no \textbf{MQAR-indirect}, um benchmark onde as
+  queries nunca repetem chaves --- recuperado sem r\'otulos pela destila\c{c}\~ao
+  de um professor quadr\'atico treinado apenas na loss de recall.
+
+\item \textbf{Estado de mem\'oria constante (\S3.3).} Uma fatora\c{c}\~ao de
+  posto~$\le S$ do cache por segmento remove o termo $d^2$ exatamente
+  ($<\!5\times10^{-7}$); limitar os segmentos vivos em $K_{\max}$ com um
+  background comprimido de baixo posto torna o estado recorrente constante em
+  $T$ --- $0{,}39$~MB em $d=64$, abaixo do cache KV a partir de
+  $T\!\approx\!1\mathrm{k}$ e $15\times$ menor projetado para 1T par\^ametros,
+  sem perda de recall na tarefa $(512,64)$.
+
+\item \textbf{Valida\c{c}\~ao em texto real e custo de deploy (\S5--\S6).} Em um
+  modelo de linguagem real em n\'ivel de caractere (3 seeds, dois contextos) a
+  IGA empata com um baseline de mem\'oria fixa de mesma largura em
+  bits-por-caractere dentro do ru\'ido entre seeds --- o estado de mem\'oria
+  constante n\~ao carrega penalidade de perplexidade --- enquanto a vantagem de
+  recall associativo mostra-se espec\'ifica da tarefa (n\~ao transfere para um
+  probe de fato plantado em texto natural nesta escala). Uma an\'alise de custo
+  mostra que o pr\^emio \'unico de treino (o gate) \'e amortizado por economias de
+  infer\^encia por query que crescem com o contexto, j\'a que a IGA \'e $O(T)$ por
+  passo com estado constante contra os $O(T^2)$ por passo da aten\c{c}\~ao softmax
+  com cache $\propto T$.
+\end{enumerate}
+
+Posicionamos os claims de recall em pequena escala (camada \'unica, $d=64$,
+recall sint\'etico) e comparamos contra aten\c{c}\~ao exata, Based
+\citep{arora2024based} e Mamba \citep{gu2023mamba} sob o protocolo oficial Zoology
+\citep{arora2023zoology} com 3 seeds em toda parte; o experimento de modelo de
+linguagem (\S5) \'e a \'unica configura\c{c}\~ao em texto real.
+
+\section{Contexto e setup}
+
+\paragraph{MQAR.} A entrada \'e \texttt{k1 v1 \ldots kN vN SEP kq1 vq1 \ldots kqQ
+vqQ}; o modelo deve prever cada valor consultado como o pr\'oximo token ap\'os sua
+chave de query. Usamos a formula\c{c}\~ao estilo Zoology com $N$ at\'e 128 pares,
+$Q=4$ queries, vocabul\'ario de chaves 192, vocabul\'ario de valores 16 (acaso
+$6{,}25\%$); treino sempre em $N=48$, 4000 passos, batch 256, AdamW
+$3\times10^{-4}$, seed id\^entica antes de cada modelo; avalia\c{c}\~ao em
+$N\in\{48,64,96,128\}$ sem retreino. No \S4 usamos adicionalmente o gerador e
+protocolo \emph{oficiais} do Zoology (vocabul\'ario 8192, lacunas de query em lei
+de pot\^encia, varredura de learning rate sobre $\mathrm{logspace}(-4,-2,4)$,
+weight decay 0{,}1, schedule cosseno, parada precoce em $99\%$).
+
+\paragraph{Mem\'oria fixa (FIXA).} Aten\c{c}\~ao linear causal
+\citep{katharopoulos2020linear} com feature map
+$\varphi(x)=\mathrm{elu}(x)+1$:
+\[
+y_t = \frac{\sum_{j\le t}\varphi(q_t)\!\cdot\!\varphi(k_j)\,v_j}
+            {\sum_{j\le t}\varphi(q_t)\!\cdot\!\varphi(k_j)}.
+\]
+Uma convolu\c{c}\~ao causal depthwise curta ($k=3$) antes das proje\c{c}\~oes
+permite que uma camada ligue pares chave--valor, como no Based/Mamba. A
+capacidade \'e limitada por $d^2$.
+
+\paragraph{Mem\'oria crescente (GRM).} Por segmento $i$:
+$M^{(i)}=\sum_j v_j\varphi(k_j)^\top$,
+$z^{(i)}=\sum_j\varphi(k_j)$. Na query $t$, cada segmento em cache contribui um
+readout \emph{normalizado}
+$r_i = M^{(i)}q_t / (z^{(i)}\!\cdot\!q_t)$, misturado por um softmax sobre massas
+de match. Esse \'e o mecanismo que colapsa.
+
+\section{M\'etodo: Agrega\c{c}\~ao com Gating por Interfer\^encia}
+
+\subsection{Agrega\c{c}\~ao que n\~ao pode colapsar}
+
+A mem\'oria fixa \'e \emph{exatamente} a agrega\c{c}\~ao gate-$\equiv 1$ dos caches
+por segmento n\~ao-normalizados:
+\[
+y_{\mathrm{fix}} = \frac{\sum_i M^{(i)}q}{\sum_i z^{(i)}\!\cdot\!q}.
+\]
+A IGA insere o gate dentro dessa raz\~ao:
+\[
+y_t = \frac{N_{\mathrm{cur}} + \sum_{i<s} g_i\,M^{(i)}q_t}
+            {m_{\mathrm{cur}} + \sum_{i<s} g_i\,z^{(i)}\!\cdot\!q_t},
+\qquad
+g_i = \sigma\!\big(a(\log s_i - \mathrm{ref}) + b\big),
+\]
+onde $s_i$ \'e um score de roteamento e $\mathrm{ref}$ \'e a m\'edia (scores de
+similaridade) ou o m\'aximo (scores de contagem) de $\log s_i$. Com $b=3$,
+$g\approx 0{,}95$ em todo lugar na init $\Rightarrow$ o modelo \emph{come\c{c}a}
+como a mem\'oria fixa; o teste de unidade \texttt{test\_ungated\_equals\_fixed}
+verifica a identidade at\'e $5\times10^{-7}$. O gate s\'o pode \emph{remover}
+interfer\^encia --- que \'e precisamente de onde vem a capacidade de $K$ mem\'orias
+pequenas sobre uma grande.
+
+\paragraph{Por que o GRM colapsa.} Instrumentando o GRM treinado em $n=16$: recall
+$25{,}2\%$, acur\'acia de roteamento do seu gate softmax $90{,}7\%$, massa do gate
+no segmento atual $\approx 0$. O matador \'e que readouts normalizados de
+segmentos errados s\~ao lixo \emph{na mesma magnitude do sinal}; um softmax
+$0{,}7/0{,}3$ mistura $30\%$ de lixo em escala plena. Nenhum conserto no softmax
+ajuda; a normaliza\c{c}\~ao tem que se mover \emph{para fora} da mistura --- o que
+a IGA faz.
+
+\subsection{Roteamento por identidade aprendida}
+
+Com a agrega\c{c}\~ao consertada, a lacuna residual da IGA ao or\'aculo \'e
+roteamento puro. O problema de roteamento \'e um problema da \emph{fam\'ilia de
+kernels}: todo score de similaridade somada (primeiro/segundo momento, features
+elementwise-exponenciais, embeddings aprendidas com supervis\~ao auxiliar) satura
+exatamente como a mem\'oria fixa, enquanto resumos que \emph{preservam
+identidade} --- o histograma de tokens ou seu count-min sketch
+\citep{cormode2005countmin} --- roteiam exatamente ($100\%/93\%+$) com zero
+par\^ametros e d\~ao recall plano no comprimento de avalia\c{c}\~ao, mas eles leem
+token IDs e as queries do MQAR repetem chaves literalmente. Linguagem real n\~ao.
+
+Precisamos de um score $s_i(q)\approx$ (ocorr\^encias da identidade de $q$ no
+segmento $i$), armazen\'avel como uma soma por segmento, diferenci\'avel, e sem
+IDs. Para embeddings quase ortonormais $\hat e$,
+$(\hat e_q\!\cdot\!\hat e_k)^p\to\delta(q=k)$ quando $p$ cresce, e o kernel
+polinomial de grau $p$ \'e exatamente lineariz\'avel:
+$(x\!\cdot\!y)^p = \langle x^{\otimes p},y^{\otimes p}\rangle$, compress\'ivel por
+tensor sketch \citep{pham2013tensorsketch} com
+$\mathbb{E}[\mathrm{ts}(x)\!\cdot\!\mathrm{ts}(y)]=(x\!\cdot\!y)^p$ e vari\^ancia
+$O(1/m)$ para vetores unit\'arios --- custo \emph{polinomial} na nitidez, onde
+estimadores estilo Performer de um $\exp(\tau q\!\cdot\!k)$ comparavelmente
+n\'itido requerem vari\^ancia exponencial em $\tau$
+\citep{choromanski2021performer}. O score do roteador \'e
+\[
+s_i = \mathrm{softplus}(w_1)\big(\hat e_q\!\cdot\!\textstyle\sum_j\hat e_{k_j}\big)
+      + \mathrm{softplus}(w_p)\,\mathrm{med}_{J}\!\big(\mathrm{ts}(\hat e_q)\!\cdot\!\textstyle\sum_j\mathrm{ts}(\hat e_{k_j})\big),
+\]
+com tr\^es elementos de design: (i) a \textbf{mediana de $J=3$ sketches
+independentes} --- o an\'alogo cont\'inuo do min do count-min --- eleva o
+roteamento de $96{,}6\%$ para $99{,}8\%$ num microbenchmark sem treino nas
+estat\'isticas exatas de segmento do MQAR ($p=4$, $m=256$, $r=64$), onde grau-1
+sozinho rende apenas $39{,}9$--$60{,}8\%$ (a mesma satura\c{c}\~ao que limita a
+mem\'oria fixa); (ii) um \textbf{termo de grau 1 para cold start}, j\'a que
+$\partial(q\!\cdot\!k)^p/\partial\mathrm{emb}$ se anula na ortogonalidade para
+$p\ge 2$, dando gradientes de alinhamento estilo word2vec quando os embeddings
+devem ser \emph{aprendidos}, com pesos de mistura aprend\'iveis que deixam o
+treino anula-lo; (iii) \textbf{liga\c{c}\~oes de gate contagem-vs-similaridade}
+--- scores de contagem fazem gate em $\log(\mathrm{clamp}(s))$ com refer\^encia
+m\'axima (supress\~ao forte desde a init), enquanto scores de poly aprendido fazem
+gate em $\log(\mathrm{softplus}(s))$ e supervisionam scores crus como logits,
+porque scores aprendidos podem ser negativos no cold start e
+$\log(\mathrm{clamp})$ cria uma zona de gradiente morto que destr\'oi o treino do
+readout (essa distin\c{c}\~ao custou uma run completa falha, documentada como
+resultado negativo). Custo do resumo: $r + J\!\cdot\!m = 832$ floats/segmento
+(count-min: 256; histograma: $V$).
+
+\paragraph{MQAR-indirect: a identidade tem que ser aprendida.} Introduzimos um
+benchmark no qual o bloco de query usa um vocabul\'ario de query \emph{disjunto},
+pareado \`as chaves por uma bije\c{c}\~ao fixa ao longo do dataset --- estrutura de
+sequ\^encia, posi\c{c}\~oes e protocolo inalterados. Por constru\c{c}\~ao,
+roteadores por contagem de IDs recebem sinal zero. Dois regimes de treino: (a)
+cross-entropy auxiliar de roteamento com r\'otulos de bije\c{c}\~ao ---
+\emph{supervis\~ao privilegiada}, um limite superior para a fam\'ilia de kernels;
+(b) \emph{destila\c{c}\~ao} --- um professor m\'inimo de aten\c{c}\~ao softmax
+quadr\'atica ($d=64$, 1 camada, embeddings pr\'oprios) treinado apenas na loss de
+recall, cuja massa de aten\c{c}\~ao por segmento \'e destilada no roteador por KL;
+o professor \'e descartado na infer\^encia (custo quadr\'atico s\'o durante o
+treino, espelhando SMT \citep{kumar2026smt}). O professor resolve a tarefa em
+$100\%$, confirmando que a aten\c{c}\~ao softmax n\~ao sofre do equil\'ibrio
+perverso.
+
+\subsection{Estado de mem\'oria constante}
+
+Uma mem\'oria crescente que supera a mem\'oria fixa em recall mas cresce sem
+limite ainda n\~ao responde \`a quest\~ao do paradigma --- seu estado eventualmente
+excederia o cache KV que deve substituir. Tornamos o estado recorrente
+\textbf{constante em $T$} em dois passos, ambos apresentados como design e n\~ao
+como remendo.
+
+\paragraph{Estado fatorado.} O cache por segmento
+$M^{(i)}=\sum_{j\in\mathrm{seg}_i}v_j\varphi(k_j)^\top$ \'e uma soma de $S$
+atualiza\c{c}\~oes de posto 1, de modo que $\mathrm{rank}(M^{(i)})\le S=16$.
+Fatoramo-lo exatamente como $M^{(i)}={U^{(i)}}^\top W^{(i)}$ com
+$U^{(i)},W^{(i)}\in\mathbb{R}^{S\times d}$ (posto $R=S$), armazenando $2dS$ floats
+por segmento em vez de $d^2$ e computando o readout
+$M^{(i)}q = {U^{(i)}}^\top(W^{(i)}q)$ a custo $2dS$ em vez de $d^2$. A
+fatora\c{c}\~ao \'e exata para uma matriz de posto~$\le S$, de modo que a sa\'ida
+do modelo \'e inalterada at\'e erro de ponto flutuante ---
+\texttt{test\_factored\_equals\_dense} verifica a identidade (limiar $10^{-4}$;
+lacuna medida $<\!5\times10^{-7}$) --- e na tarefa oficial do Zoology $(512,64)$ o
+modelo fatorado iguala o denso dentro do ru\'ido entre seeds (denso
+$99{,}02\pm0{,}17$, fatorado $99{,}18\pm0{,}08$, 3 seeds). A fatora\c{c}\~ao
+remove o termo quadr\'atico-na-largura ($d^2\to 2dS$: $4096\to 2048$ elementos em
+$d=64$), mas o estado ainda cresce com o n\'umero de segmentos, $O(T/S)$.
+
+\paragraph{Mem\'oria limitada (capped).} Limitamos o n\'umero de segmentos em
+cache \emph{vivos} em $K_{\max}$ e comprimimos o overflow num \'unico background
+de baixo posto de posto $r_{\mathrm{bg}}$. O estado recorrente se torna
+\[
+\mathrm{state} = K_{\max}\!\cdot\!\mathrm{per\_seg}
+               + (2d\,r_{\mathrm{bg}} + d + m) + K_{\max},
+\]
+independente de $T$, onde $\mathrm{per\_seg}=2dS+d+m$. A compress\~ao \'e uma
+evacua\c{c}\~ao FIFO determin\'istica com normaliza\c{c}\~ao do readout
+comprimido; segmentos vivos e o background comprimido s\~ao misturados dentro da
+raz\~ao global \'unica da IGA, de modo que a agrega\c{c}\~ao com gating por
+interfer\^encia do \S3.1 \'e preservada. Na tarefa oficial $(512,64)$ o contexto
+\'e exatamente $K_{\max}=32$ segmentos, de modo que nenhuma evacua\c{c}\~ao ocorre
+e o modelo limitado \'e um no-op: o recall \'e id\^entico ao modelo fatorado
+n\~ao-limitado --- $99{,}23/99{,}30/99{,}02$ (m\'edia $99{,}18$) em tr\^es seeds. O
+pre\c{c}o honesto da mem\'oria constante \'e que segmentos mais antigos que
+$K_{\max}$ s\~ao comprimidos (com perdas): o recall de fatos dentro dos \'ultimos
+$K_{\max}$ segmentos acompanha o baseline ilimitado mesmo com centenas de
+evacua\c{c}\~oes, enquanto fatos mais antigos n\~ao s\~ao individualmente
+recuper\'aveis --- o tradeoff expl\'icito recall/mem\'oria.
+
+\section{Experimentos --- recall associativo}
+
+Todos os n\'umeros s\~ao m\'edia $\pm$ desvio em 3 seeds salvo nota. Baselines:
+aten\c{c}\~ao exata (MHA de 2 camadas com posi\c{c}\~oes aprendidas), Based
+(h\'ibrido oficial: BaseConv + aten\c{c}\~ao linear de Taylor), Mamba (S6;
+reimplementa\c{c}\~ao em PyTorch puro com scan paralelo exato, testado por
+unidade contra a refer\^encia sequencial). Backbone, inicializa\c{c}\~ao (esquema
+GPT-2) e hiperpar\^ametros seguem a configura\c{c}\~ao Figure-2 do Zoology. Um
+achado negativo, verificado contra a implementa\c{c}\~ao \emph{oficial}: a
+configura\c{c}\~ao Figure-2 de aten\c{c}\~ao apenas de 2 camadas n\~ao forma o
+circuito de indu\c{c}\~ao sob nosso protocolo de fluxo infinito (amostras frescas
+a cada passo removem o bootstrap de memoriza\c{c}\~ao); ela estabiliza em
+$\sim$$13\%$ atrav\'es de learning rates, e o
+\texttt{zoology.model.LanguageModel} oficial treinado sob o mesmo loop d\'a
+$12{,}3\%$ --- id\^entico \`a nossa r\'eplica --- enquanto sob o regime oficial de
+dados fixos nossa r\'eplica \emph{reproduz} a transi\c{c}\~ao de induction-head
+publicada. Reportamos portanto \textbf{attention-conv} --- um modelo de
+aten\c{c}\~ao exata de camada \'unica com o mesmo stem de convolu\c{c}\~ao curta
+que todo outro modelo tem --- como a \^ancora superior funcional.
+
+\subsection{MQAR literal (nosso protocolo)}
+
+Treino em $n=48$ ($n_k=192$), avalia\c{c}\~ao sem retreino; acaso $6{,}25\%$.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\toprule
+modelo & $n{=}48$ & $n{=}64$ & $n{=}96$ & $n{=}128$ \\
+\midrule
+aten\c{c}\~ao (Zoology fig2) & 12.9\,$\pm$\,0.0 & 11.1\,$\pm$\,0.5 & 9.7\,$\pm$\,0.5 & 9.0\,$\pm$\,0.4 \\
+based                   & 8.3\,$\pm$\,0.1  & 7.9\,$\pm$\,0.2  & 7.3\,$\pm$\,0.2 & 7.3\,$\pm$\,0.1 \\
+mamba                   & 13.3\,$\pm$\,0.0 & 12.3\,$\pm$\,0.1 & 10.6\,$\pm$\,0.2 & 9.6\,$\pm$\,0.4 \\
+FIXA(64)                & 77.9\,$\pm$\,1.0 & 71.6\,$\pm$\,0.8 & 59.9\,$\pm$\,0.4 & 50.9\,$\pm$\,0.4 \\
+FIXA(128)               & 92.1\,$\pm$\,0.5 & 88.8\,$\pm$\,0.6 & 81.8\,$\pm$\,1.0 & 74.5\,$\pm$\,1.1 \\
+IGA-hist (IDs)          & 98.3\,$\pm$\,0.1 & 98.3\,$\pm$\,0.1 & 98.4\,$\pm$\,0.2 & \textbf{98.5\,$\pm$\,0.1} \\
+IGA-sketch (IDs)        & 98.1\,$\pm$\,0.1 & 98.1\,$\pm$\,0.1 & 98.1\,$\pm$\,0.2 & 98.0\,$\pm$\,0.2 \\
+\textbf{IGA-poly (sem IDs)} & 97.7\,$\pm$\,0.1 & 97.6\,$\pm$\,0.2 & 97.5\,$\pm$\,0.2 & \textbf{97.1\,$\pm$\,0.2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Todas as variantes IGA s\~ao planas no comprimento de avalia\c{c}\~ao; o roteador
+polinomial sem IDs paga $0{,}8$--$1{,}4$ pontos de ru\'ido de sketch relativo ao
+histograma exato. Os baselines de literatura de 2 camadas falham nesse regime (48
+pares em $d=64$, muito al\'em do cen\'ario favor\'avel \`a capacidade deles).
+
+\subsection{MQAR-indirect}
+
+Mesmo protocolo; a query nunca repete a chave.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\toprule
+modelo & $n{=}48$ & $n{=}64$ & $n{=}96$ & $n{=}128$ \\
+\midrule
+aten\c{c}\~ao (Zoology fig2) & 13.1\,$\pm$\,0.1 & 11.5\,$\pm$\,0.4 & 9.9\,$\pm$\,0.2 & 9.2\,$\pm$\,0.2 \\
+based                     & 7.4\,$\pm$\,0.3  & 7.3\,$\pm$\,0.1  & 6.8\,$\pm$\,0.2 & 6.8\,$\pm$\,0.1 \\
+mamba                    & 13.3\,$\pm$\,0.0 & 12.2\,$\pm$\,0.1 & 10.6\,$\pm$\,0.3 & 9.6\,$\pm$\,0.3 \\
+FIXA(64)                 & 57.6\,$\pm$\,20.8 & 51.4\,$\pm$\,19.4 & 42.5\,$\pm$\,16.2 & 36.8\,$\pm$\,13.9 \\
+IGA-sketch (controle)     & 57.2\,$\pm$\,20.6 & 50.9\,$\pm$\,19.1 & 42.1\,$\pm$\,15.9 & 36.4\,$\pm$\,13.6 \\
+IGA-emb+aux (fam. exp)    & 68.6\,$\pm$\,17.8 & 62.2\,$\pm$\,17.9 & 52.1\,$\pm$\,16.0 & 45.1\,$\pm$\,13.8 \\
+\textbf{IGA-poly+aux (privilegiado)}        & 96.1\,$\pm$\,0.7 & 95.8\,$\pm$\,0.7 & 95.4\,$\pm$\,0.7 & \textbf{94.8\,$\pm$\,0.9} \\
+\textbf{IGA-poly destilado (sem r\'otulos)}   & 93.5\,$\pm$\,1.0 & 92.6\,$\pm$\,1.4 & 90.5\,$\pm$\,1.8 & \textbf{88.2\,$\pm$\,2.2} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+O controle por contagem de IDs acompanha a FIXA seed a seed (roteamento
+$6{,}0\%=$ acaso), confirmando que o benchmark remove o atalho literal por
+constru\c{c}\~ao. O roteador de kernel polinomial preserva a propriedade de recall
+plano com identidade \emph{totalmente aprendida}: $+58$ pontos sobre a
+mem\'oria fixa em $n=128$, e a variante destilada sem r\'otulos ret\'em
+$93$--$96\%$ do limite superior privilegiado.
+
+\subsection{Protocolo oficial Zoology (vocabul\'ario 8192)}
+
+Gerador e loop de treino oficiais; 3 seeds, m\'edia $\pm$ desvio.
+
+\begin{table}[h]\centering
+\begin{tabular}{lcc}
+\toprule
+modelo & $(128,8)$ f\'acil & $(512,64)$ dif\'icil \\
+\midrule
+aten\c{c}\~ao (softmax total)          & 99.4\,$\pm$\,0.3 & 100.0\,$\pm$\,0.0 \\
+attention-conv (\^ancora 1-camada)   & 99.3\,$\pm$\,0.3 & 99.4\,$\pm$\,0.0 \\
+based                             & 99.2\,$\pm$\,0.2 & 79.5\,$\pm$\,1.4 \\
+mamba                             & 99.1\,$\pm$\,0.0 & 23.2\,$\pm$\,14.0 \\
+\textbf{IGA-sketch (nosso)}        & 99.1\,$\pm$\,0.0 & \textbf{99.1\,$\pm$\,0.0} \\
+\textbf{IGA-poly (nosso, ident. aprendida)} & 99.1\,$\pm$\,0.0 & \textbf{99.2\,$\pm$\,0.1} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+O regime discriminante \'e $(512,64)$: 64 pares chave--valor sobre um contexto
+de 512 tokens ($32$ segmentos de $S=16$ --- $2\times$ mais segmentos que qualquer
+cen\'ario acima). Todos os seis modelos resolvem a tarefa f\'acil. Na tarefa
+dif\'icil os baselines eficientes se separam exatamente como o paper Based
+relata: \textbf{Mamba colapsa ($23{,}2\pm14{,}0$, uma seed em $7\%$ --- a
+satura\c{c}\~ao de estado fixo) e Based degrada ($79{,}5\pm1{,}4$).}
+\textbf{Ambos os modelos IGA se mant\^em em $\sim\!99\%$}, empatando com a
+aten\c{c}\~ao softmax total ($100\%$) e a \^ancora de aten\c{c}\~ao convolucional
+($99{,}4$), a custo por token sub-quadr\'atico. Esse \'e o resultado cit\'avel que
+fecha a compara\c{c}\~ao: no benchmark pr\'oprio da literatura, na sua
+configura\c{c}\~ao-padr\~ao mais dif\'icil, a mem\'oria crescente mant\'em recall
+quase perfeito onde os modelos de estado fixo falham.
+
+\subsection{Custo de infer\^encia}
+
+Batch 1, $d=64$, fp32, loops Python de refer\^encia em ambos os lados
+(compara\c{c}\~ao de escala, n\~ao constantes de engenharia).
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccl}
+\toprule
+modelo & $T{=}4096$ & $T{=}16384$ & $T{=}65536$ & estado @ $T{=}65536$ \\
+ & tok/s & tok/s & tok/s & \\
+\midrule
+aten\c{c}\~ao (SDPA, cache KV)      & 3577 & 997 & 253 & 32.0~MB ($\propto T$) \\
+IGA-poly recorrente, gate soft   & 3337 & 3721 & 3167 & \textbf{0.39~MB} (const) \\
+IGA-poly recorrente, top-1 duro & 4885 & 4725 & \textbf{4455} & \textbf{0.39~MB} (const) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A vaz\~ao da IGA \'e $\sim$plana no comprimento do contexto; a aten\c{c}\~ao exata
+incremental degrada linearmente, $17{,}6\times$ mais lenta em $64$k. A coluna de
+estado relata o estado de mem\'oria constante do \S3.3 --- $0{,}39$~MB constante
+--- contra um cache KV que cresce $\propto T$ ($32$~MB em $64$k). O crossover de
+vaz\~ao e o estado sub-KV constante s\~ao os claims.
+
+\subsection{Escalonamento de mem\'oria constante e o regime de contexto longo}
+
+Com o estado fatorado + limitado, o estado recorrente \'e constante em $T$.
+Medido com \texttt{state\_bytes} ($d=64$, $K_{\max}=32$, $r_{\mathrm{bg}}=16$,
+fp32) em $0{,}39$~MB contra o cache KV $2Td$:
+
+\begin{table}[h]\centering
+\begin{tabular}{lccl}
+\toprule
+$T$ & cache KV & IGA (constante) & raz\~ao \\
+\midrule
+512   & 0.25~MB  & 0.39~MB & 1.53$\times$ \\
+1024  & 0.50~MB  & 0.39~MB & 0.76$\times$ \\
+2048  & 1.00~MB  & 0.39~MB & 0.38$\times$ \\
+4096  & 2.00~MB  & 0.39~MB & 0.19$\times$ \\
+65536 & 32.0~MB  & 0.39~MB & 0.012$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+O estado iguala o cache no crossover $T\approx 2K_{\max}S$ (onde o cache enche
+exatamente $K_{\max}$ segmentos); abaixo dele o estado constante \'e maior ---
+ele \'e dimensionado para capacidade, n\~ao para o contexto atual --- e acima dele
+a vantagem cresce sem limite. Projetado para um regime de 1T par\^ametros
+($d=8192$, $K_{\max}=4096$, $r_{\mathrm{bg}}=4$), o estado constante \'e
+$209{,}5$~GB $=0{,}065\times$ o cache KV de $3{,}1$~TB ---
+\textbf{$15\times$ menor, e constante} --- onde o estado denso da IGA seria
+$800$~TB ($256\times$ maior) e mesmo o estado fatorado-mas-ilimitado \'e
+$3{,}2$~TB (paridade, ainda crescente). O estado sub-KV constante \'e o resultado
+de mem\'oria.
+
+\section{Modelagem de linguagem em texto real: mem\'oria constante sem custo de
+perplexidade}
+
+Todos os resultados do \S4 usam recall associativo sint\'etico. Fechamos a
+quest\~ao restante --- o IGA de mem\'oria constante carrega uma penalidade de
+perplexidade em \emph{texto real}? --- treinando um modelo de linguagem IGA de 2
+camadas, $d=128$ (tamanho de segmento 64; roteador polinomial de tensor-sketch
+lendo tokens crus; estado fatorado do \S3.3) contra a arquitetura
+\emph{id\^entica} com o gate desativado (\texttt{gated=False}, o baseline de
+mem\'oria fixa FIXA de mesma largura e contagem de par\^ametros). Os dados s\~ao
+TinyStories em n\'ivel de caractere, 88~MB, baixados --- nenhum dado sint\'etico
+\'e gerado para qualquer experimento de modelo de linguagem. Otimizador AdamW
+$3\times10^{-4}$, batch 16, 4000 passos, 3 seeds, contextos $\{1024, 2048\}$.
+Reportamos bits-por-caractere (bpc) numa fra\c{c}\~ao held-out de $5\%$ e um probe
+de recall de fato plantado --- o an\'alogo do MQAR em texto natural --- em
+tr\^es dist\^ancias (ctx/4, ctx/2, ctx$-$64).
+
+\begin{table}[h]\centering
+\begin{tabular}{lccccc}
+\toprule
+ctx & IGA bpc & FIXA bpc & $\Delta$ bpc (IGA$-$FIXA) & recall@ctx$-$64 IGA & recall@ctx$-$64 FIXA \\
+\midrule
+1024 & 2.1607\,$\pm$\,0.0060 & 2.1621\,$\pm$\,0.0084 & $-$0.0015 & 1.67 & 1.67 \\
+2048 & 2.1138\,$\pm$\,0.0114 & 2.1143\,$\pm$\,0.0127 & $-$0.0005 & 2.29 & 2.08 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Dois achados. (i) \textbf{Sem custo de perplexidade.} A diferen\c{c}a de bpc \'e
+$-0{,}0015$ (ctx 1024) e $-0{,}0005$ (ctx 2048), ambas uma ordem de magnitude
+abaixo do desvio por seed ($0{,}006$--$0{,}013$); a IGA nunca \'e
+consistentemente pior nas seis runs (modelo, seed). O estado de mem\'oria
+constante portanto n\~ao degrada a modelagem de linguagem relativamente a um
+modelo de mem\'oria fixa de mesma largura e contagem de par\^ametros. (ii)
+\textbf{A vantagem de recall \'e espec\'ifica da tarefa.} O probe de fato
+plantado \'e pr\'oximo do acaso para ambos os modelos em ambos os contextos
+($1{,}7$--$2{,}3\%$, spread por seed $0$--$4{,}4\%$ --- ru\'ido puro, sem
+depend\^encia de dist\^ancia); a vantagem de recall plano do \S4 n\~ao transfere
+para a recupera\c{c}\~ao de um fato plantado arbitr\'ario em texto natural em
+$d=128$. O benchmark estruturado MQAR permanece o instrumento certo para o claim
+de recall associativo; a recupera\c{c}\~ao em texto natural nesta escala n\~ao
+separa as arquiteturas, e escalar $d$/ctx para surgir uma separa\c{c}\~ao fica
+como trabalho futuro (limitado por or\c{c}amento de GPU).
+
+\paragraph{Computa\c{c}\~ao.} A IGA custa $5{,}2\times$ (ctx 1024) e
+$4{,}9\times$ (ctx 2048) mais wall-clock por passo que a FIXA na nossa
+implementa\c{c}\~ao de refer\^encia em loop Python --- a normaliza\c{c}\~ao por
+segmento do gate, dominada por overhead de loop em vez de FLOPs assint\'oticos. O
+tradeoff \'e mem\'oria-vs-computa\c{c}\~ao (estado $O(1)$ constante contra
+computa\c{c}\~ao por passo maior), n\~ao mem\'oria-vs-qualidade: a qualidade \'e
+igualada dentro do ru\'ido.
+
+Notamos honestamente que uma run preliminar de 300 passos no projeto-pai reportou
+um ganho de $\sim$$0{,}016$ bpc em ctx $\ge 2048$; ele \textbf{n\~ao} reproduz sob
+o protocolo de 3 seeds, 4000 passos aqui ($\Delta=-0{,}0005$, dentro do
+ru\'ido). O resultado de modelo de linguagem \'e um resultado de
+n\~ao-regress\~ao, n\~ao um ganho de qualidade.
+
+\section{Economia de deploy: onde a mem\'oria constante compensa}
+
+Esta se\c{c}\~ao sintetiza o \S4.4 (vaz\~ao), \S4.5 (mem\'oria) e \S5 (qualidade
+LM) no quadro de custo de deploy --- o regime em que um modelo de mem\'oria
+crescente \'e de fato destinado a substituir um transformer com cache KV.
+
+\paragraph{Treino (\'unica vez).} Por passo, a aten\c{c}\~ao softmax \'e
+$O(T^2 d)$ --- os produtos QK$^\top$ e AV sobre a matriz $T\!\times\!T$ completa
+--- enquanto a recorr\^encia de aten\c{c}\~ao linear da IGA \'e $O(Td^2)$ (a
+atualiza\c{c}\~ao do estado fatorado \'e $O(TdS)$, menor). O escalonamento
+assint\'otico de FLOPs portanto favorece a IGA conforme o contexto cresce, com
+raz\~ao $T/d$: $\sim$$8\times$ menos FLOPs de aten\c{c}\~ao em ctx 1024
+($d=128$), $\sim$$512\times$ em $T=64$k ($d=64$). N\~ao treinamos um baseline
+transformer de modelo de linguagem, de modo que declaramos a compara\c{c}\~ao de
+custo de treino como an\'alise de complexidade, n\~ao como n\'umero medido; a
+\'unica compara\c{c}\~ao que \emph{medimos} ponta a ponta \'e a vaz\~ao de
+infer\^encia contra aten\c{c}\~ao exata (\S4.4: $14$--$17{,}6\times$ em $64$k). O
+pr\^emio de wall-clock de $5\times$ do \S5, em contraste, \emph{\'e} medido ---
+contra o \emph{baseline linear de mem\'oria fixa} (FIXA), o controle
+same-family relevante para o overhead do gate.
+
+\paragraph{Infer\^encia (recorrente, por token gerado).} Um transformer com
+cache KV l\^e o cache completo por token --- tr\'afego de mem\'oria $O(TdL)$ ---
+e mant\'em um cache de $2TdL$ que cresce $\propto T$. A IGA l\^e um
+$O(K_{\max}dS)$ constante por token e mant\'em um estado constante. Medido em
+batch 1, $d=64$ (\S4.4): a IGA mant\'em $\sim$$4{,}5$k tok/s plano de $T=4$k a
+$64$k, enquanto a aten\c{c}\~ao exata incremental degrada $\sim$$14\times$ para
+$253$ tok/s em $64$k. O custo de infer\^encia por token da IGA \'e constante em
+$T$; o do transformer cresce com $T$.
+
+\paragraph{Amortiza\c{c}\~ao.} O treino \'e pago uma vez; a infer\^encia \'e paga
+por query ao longo da vida de serving do modelo. O pr\^emio \'unico de $5\times$
+do gate (contra o baseline linear) \'e amortizado pelas economias recorrentes de
+infer\^encia uma vez que o contexto servido \'e longo o bastante para o estado
+constante ficar abaixo do cache --- o crossover $T\approx 2K_{\max}S$ do \S4.5,
+$15\times$ menor projetado para 1T. Abaixo do crossover, onde o cache \'e ele
+pr\'oprio pequeno e a aten\c{c}\~ao \'e r\'apida, o transformer \'e a op\c{c}\~ao
+mais barata e a vantagem da IGA \'e apenas a capacidade de recall do \S4; acima
+dele, o custo por token da IGA para de crescer enquanto o do transformer continua
+crescendo, de modo que o custo total de servir contextos longos eventualmente
+favorece a IGA por uma margem ilimitada. Passado o ponto em que o cache KV n\~ao
+cabe mais no dispositivo, a IGA n\~ao \'e a op\c{c}\~ao mais barata mas a \'unica
+vi\'avel.
+
+Esse \'e um argumento de estrutura de custo, n\~ao uma cifra de deploy em
+d\'olar: o custo absoluto depende de hardware, batching e fus\~ao de kernels n\~ao
+modelados aqui (loops Python de refer\^encia). O claim estrutural ---
+mem\'oria $O(1)$ e computa\c{c}\~ao por token $O(1)$-em-$T$ contra $O(T)$ e
+$O(T)$ para o cache, com qualidade LM igualada (\S5) --- \'e o que o resultado de
+mem\'oria constante compra. Esse \'e o ``no pain'': o custo da mem\'oria
+crescente \'e removido. O ``same gain'' \'e o recall igualado (\S4.3) e a
+perplexidade igualada (\S5).
+
+\section{Trabalho relacionado}
+
+\paragraph{Benchmarks de recall em aten\c{c}\~ao eficiente.} Zoology
+\citep{arora2023zoology} estabeleceu o MQAR como a tarefa discriminante entre
+aten\c{c}\~ao e misturadores eficientes; Based \citep{arora2024based} enquadra o
+tradeoff recall-vaz\~ao. Adotamos o harness deles e adicionamos MQAR-indirect,
+que isola o \emph{aprendizado de identidade} da \emph{explora\c{c}\~ao de
+identidade} --- ao nosso conhecimento o primeiro benchmark de recall onde as
+queries nunca repetem chaves por constru\c{c}\~ao.
+
+\paragraph{Mem\'oria crescente.} Memory Caching
+\citep{behrouz2026memorycaching} prop\~oe mem\'orias em cache por segmento com
+agrega\c{c}\~ao gated (GRM entre suas variantes). Mantemos seu layout de estado
+($M^{(i)}, z^{(i)}$) e custo, e substitu\'imos sua agrega\c{c}\~ao (a causa do
+colapso) e seu roteamento (a causa da satura\c{c}\~ao). Seu estado cresce com o
+n\'umero de segmentos em cache ($O(T/S)$, quadr\'atico na largura via $d^2$);
+nosso estado fatorado + limitado (\S3.3) \'e constante em $T$ e linear na
+largura, removendo o crescimento que de outra forma excederia o cache KV que deve
+substituir.
+
+\paragraph{Sketches polinomiais em aten\c{c}\~ao.} PolySketchFormer
+\citep{kacham2023polysketchformer} usa sketches polinomiais para
+\emph{substituir o kernel de aten\c{c}\~ao em si}. Nosso uso \'e diferente: o
+sketch resume a \emph{identidade do segmento} para roteamento numa RNN de
+mem\'oria crescente; aten\c{c}\~ao/readout mant\'em seu pr\'oprio feature map.
+Count sketch \citep{charikar2002countsketch}, count-min
+\citep{cormode2005countmin} e tensor sketch \citep{pham2013tensorsketch}
+fornecem os estimadores; a variante mediana-de-$J$ espelha o min do count-min sob
+estimativas com sinal.
+
+\paragraph{Aten\c{c}\~ao linear e SSMs.} A mem\'oria fixa \'e
+\citet{katharopoulos2020linear}; Based e Mamba s\~ao os baselines de recall em
+pequena escala mais fortes nessa fam\'ilia. Performer
+\citep{choromanski2021performer} aproxima $\exp(q\!\cdot\!k)$ com features
+aleat\'orias; nosso argumento de vari\^ancia (\S3.2) explica por que essa
+fam\'ilia n\~ao pode fornecer roteamento de identidade $\delta$-n\'itido a
+or\c{c}amento de feature fixo.
+
+\paragraph{Destila\c{c}\~ao entre classes de computa\c{c}\~ao.} SMT
+\citep{kumar2026smt} treina uma RNN com um professor paralelo; nossa
+destila\c{c}\~ao professor$\to$roteador transfere \emph{roteamento} (n\~ao
+atualiza\c{c}\~oes de estado) e \'e, ao nosso conhecimento, a primeira
+recupera\c{c}\~ao sem r\'otulos de roteamento de identidade num modelo de
+mem\'oria crescente.
+
+\section{Limita\c{c}\~oes e notas honestas}
+
+\begin{itemize}
+\item Recall sint\'etico de camada \'unica $d=64$ \'e o cen\'ario principal; o
+  modelo de linguagem do \S5 usa 2 camadas, $d=128$, TinyStories em n\'ivel de
+  caractere, 3 seeds, dois contextos (corpus baixado, sem dados sint\'eticos). A
+  IGA iguala o baseline de mem\'oria fixa em bpc dentro do ru\'ido entre seeds
+  (sem custo de perplexidade), mas o probe de recall de fato plantado \'e
+  pr\'oximo do acaso para ambos nesta escala, e o ganho de $\sim$$0{,}016$ bpc
+  reportado por uma run preliminar de 300 passos \emph{n\~ao} reproduz sob o
+  protocolo de 3 seeds 4000 passos; a vantagem de recall associativo \'e
+  demonstrada em MQAR estruturado (\S4), n\~ao em recupera\c{c}\~ao em texto
+  natural em $d=128$. Escalar $d$ e contexto para surgir uma separa\c{c}\~ao de
+  recall em texto real fica como trabalho futuro (limitado por
+  or\c{c}amento de GPU).
+\item A bije\c{c}\~ao indireta \'e 1-para-1 e determin\'istica; par\'afrase real
+  \'e muitos-para-muitos e ruidosa.
+\item O bra\c{c}o auxiliar privilegiado usa r\'otulos de bije\c{c}\~ao; o
+  bra\c{c}o de destila\c{c}\~ao os remove mas adiciona um professor
+  quadr\'atico \emph{apenas durante o treino}. Nenhum bra\c{c}o aprende roteamento
+  a partir do gradiente de recall sozinho --- a an\'alise de fam\'ilia de
+  roteamento do \S3.2 sugere que isso \'e imposs\'ivel nesse regime
+  (equil\'ibrio perverso); declaramos como conjectura, n\~ao como teorema.
+\item Mamba \'e uma reimplementa\c{c}\~ao em PyTorch puro (scan exato, testado por
+  unidade); compara\c{c}\~oes de wall-clock absolutas a implementa\c{c}\~oes com
+  kernels fundidos seriam injustas e n\~ao s\~ao feitas --- apenas a acur\'acia da
+  tarefa \'e comparada.
+\item O benchmark de custo usa loops Python de refer\^encia em ambos os lados
+  (sem kernels fundidos); ele mede \emph{escala}, n\~ao constantes de
+  engenharia. O estado recorrente \'e constante em $T$ (\S3.3) e abaixo do cache
+  KV a partir de $T\approx 1\mathrm{k}$ em diante; nos menores contextos
+  ($T\lesssim 2K_{\max}S$) o estado constante \'e dimensionado para capacidade e
+  excede o cache. Segmentos mais antigos que $K_{\max}$ s\~ao comprimidos (com
+  perdas), o tradeoff expl\'icito recall/mem\'oria.
+\item Seeds: 3 por c\'elula. Desvio \'e desvio amostral (Bessel). Nenhuma busca de
+  hiperpar\^ametro foi feita para nossos modelos al\'em do microbenchmark E0
+  ($p,m,J,r$); os baselines receberam a varredura oficial de learning rate.
+\end{itemize}
+
+\section{Reprodu\c{c}\~ao}
+
+\begin{verbatim}
+pip install -r requirements.txt
+python3 tests/test_sanity.py          # 14 equivalence/property tests
+                                       # (incl. factored==dense <5e-7, IGA==fixed at init)
+python3 scripts/run_cost.py            # inference cost (~5 min)
+python3 scripts/run_multiseed.py all   # our models, 3 seeds
+python3 scripts/run_baselines_ours.py all   # literature baselines, our protocol
+python3 scripts/run_zoology.py all     # official protocol (incl. (512,64))
+python3 scripts/aggregate.py          # tables (mean +/- std)
+python3 scripts/run_factored_check.py # factored vs dense recall at (512,64), 3 seeds
+python3 scripts/run_fixb_check.py      # capped-memory recall == factored + constant-state table
+python3 scripts/project_memory.py     # memory projection (small/medium/1T)
+# Real-text language modeling (downloaded TinyStories; isolated folder):
+python3 multicamada/run_lm_ml.py --steps 4000 --ctx 1024 --seeds 0,1,2 --tag lm_full
+python3 multicamada/run_lm_ml.py --steps 4000 --ctx 2048 --seeds 0,1,2 --tag lm_full_ctx2048
+\end{verbatim}
+
+O experimento de modelo de linguagem usa o modelo multicamada existente do
+reposit\'orio \texttt{IGALM} (\texttt{src/models/iga\_layer.py},
+$n_{\mathrm{layers}}{=}2$, $d=128$, factored-capable) comparado contra si mesmo
+com \texttt{gated=False} (o baseline FIXA de largura/par\^ametros equivalentes),
+isolado na pasta \texttt{multicamada/}. O corpus \'e a amostra TinyStories
+baixada (88~MB); nenhum dado sint\'etico de LM \'e gerado. Todas as runs s\~ao
+retom\'aveis (skip-if-exists por JSON em \texttt{results/raw/}).
+
+\bibliography{references}
+
+\end{document}
